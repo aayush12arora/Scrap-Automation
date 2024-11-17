@@ -1,0 +1,27 @@
+service: scrap-Automation
+
+provider:
+  name: aws
+  runtime: nodejs18.x
+  region: us-east-1
+  timeout: 30
+  memorySize: 1024
+  environment:
+    TMPDIR: /tmp
+
+functions:
+  captchaHandler:
+    handler: index.handler
+    events:
+      - http:
+          path: /
+          method: post
+
+plugins:
+  - serverless-plugin-chrome
+
+custom:
+  chrome:
+    flags:
+      - --no-sandbox
+      - --disable-dev-shm-usage
