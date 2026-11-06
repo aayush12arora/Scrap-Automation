@@ -1,11 +1,15 @@
-
-import puppeteer from 'puppeteer';
+import puppeteer from 'puppeteer-core';
 import Tesseract from 'tesseract.js';
-import chromium from '@sparticuz/chromium-min'
-import { createClient } from '@supabase/supabase-js'
+import chromium from '@sparticuz/chromium';
+import { createClient } from '@supabase/supabase-js';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
+const IS_LAMBDA = !!process.env.AWS_LAMBDA_FUNCTION_NAME;
+const PROJECT_DIR = path.dirname(fileURLToPath(import.meta.url)); // folder containing eng.traineddata
+const CAPTCHA_PATH = path.join(IS_LAMBDA ? '/tmp' : os.tmpdir(), 'captcha.jpg'); // Lambda can only write to /tmp
 
 let browser;
 let page;
@@ -41,15 +45,28 @@ const BondRunners = ['VA', 'VA', 'VA', 'VA', 'AS', 'VA', 'VA', 'VA', 'VA', 'VA',
   'VA', 'VA', 'VA', 'AS', 'VA', 'VA', 'VA', 'AS', 'VA', 'VA', 'VA', 'VA', 'VA', 'VA', 'VA', 'VA', 'AS', 'VA', 'VA', 'VA', 'VA', 'VA', 'VA',
   'AS', 'VA', 'VA', 'VA', 'VA', 'VA', 'AS', 'AS', 'VA', 'VA', 'VA', 'VA', 'VA', 'VA', 'VA', 'VA', 'VA', 'VA', 'VA', 'VA', 'VA', 'VA', 'VA',
   'VA', 'VA', 'VA', 'VA', 'VA', 'AS', 'AS', 'AS', 'AS', 'AS', 'VA', 'VA', 'GM', 'GM', 'AS', 'VA', 'AS', 'VA', 'VA', 'AS', 'AS', 'VA']
+
+
+
 // Initialize Puppeteer browser if not already open
 async function initBrowser() {
   if (!browser) {
-    browser = await puppeteer.launch({
-      args: ['--no-sandbox'],
-      headless: false,
-
-    });
-    page = (await browser.pages())[0];
+    if (IS_LAMBDA) {
+      browser = await puppeteer.launch({
+        args: chromium.args,
+        defaultViewport: chromium.defaultViewport,
+        executablePath: await chromium.executablePath(),
+        headless: chromium.headless,
+      });
+    } else {
+      // Local run: use installed Chrome (override with CHROME_PATH env var)
+      browser = await puppeteer.launch({
+        executablePath: process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+        args: ['--no-sandbox'],
+        headless: process.env.HEADLESS === 'true',
+      });
+    }
+    page = (await browser.pages())[0] || (await browser.newPage());
   }
 }
 
@@ -71,8 +88,7 @@ async function captureCaptchaImage(url, selector) {
       },
     });
 
-    const tmpFilePath = path.resolve('captcha.jpg');
-    fs.writeFileSync(tmpFilePath, image);
+    fs.writeFileSync(CAPTCHA_PATH, image);
     console.log("captured Image");
     return image;
   } else {
@@ -82,12 +98,15 @@ async function captureCaptchaImage(url, selector) {
 
 // Recognize text from saved captcha image
 async function recognizeCaptcha() {
-  const imagePath = path.resolve('captcha.jpg');
   try {
     const { data: { text } } = await Tesseract.recognize(
-      imagePath,
+      CAPTCHA_PATH,
       'eng',
-      { logger: (m) => console.log(m) }
+      {
+        langPath: PROJECT_DIR,   // use bundled eng.traineddata, no download
+        gzip: false,
+        cachePath: IS_LAMBDA ? '/tmp' : os.tmpdir(),
+      }
     );
     return text.replace(/\s+/g, '');
   } catch (error) {
@@ -100,9 +119,10 @@ async function recognizeCaptcha() {
 
 // Retrieve data based on form inputs
 async function retrieveData(allVillages, allFactories, allGrowers, BondRunners) {
-  let currentDate =formatCurrentDate();
-  console.log("currentDate is",currentDate.toString());
-  currentDate= currentDate.toString();
+  let currentDate = formatCurrentDate();
+  console.log("currentDate is", currentDate.toString());
+  currentDate = currentDate.toString();
+
   try {
     await page.select('#DdlDistrict', '21');
   } catch (e) {
@@ -118,7 +138,7 @@ async function retrieveData(allVillages, allFactories, allGrowers, BondRunners) 
   for (let j = 0; j < allVillages.length; j++) {
     try {
       console.log(`Selecting factory: ${allFactories[j]} for village: ${allVillages[j]} and grower: ${allGrowers[j]}`);
-
+      console.log('Final List as of now :', JSON.stringify({ captcha: '', tickets: finalList }, null, 2));
       await page.select('#DdlFactory', allFactories[j]);
 
       await page.waitForFunction(() => {
@@ -155,10 +175,10 @@ async function retrieveData(allVillages, allFactories, allGrowers, BondRunners) 
       await sleep(600);
       //  console.log(" ticket tab aagye");
 
-
-      const rawData = await page.evaluate((fatherName, growerName, villageName, runner, currentDate) => {
+      const factorySelectValue = allFactories[j] == "6" ? "TIKAULA" : "MAWANA";
+      const rawData = await page.evaluate((fatherName, growerName, villageName, runner, currentDate, factorySelectValue) => {
         let data = [];
-       
+
         let table = document.getElementById('tcMasterInfo_tplSupply_grdSupply');
         // console.log(" table access kiya");
 
@@ -166,61 +186,83 @@ async function retrieveData(allVillages, allFactories, allGrowers, BondRunners) 
           for (let i = 1; i < table.rows.length; i++) {
             let objCells = table.rows.item(i).cells;
             //console.log("till here");
-            if ( objCells.item(4).innerText.trim() === currentDate) {
+            if (objCells.item(4).innerText.trim() === currentDate) {
               let values = {
                 ticketNo: objCells.item(0)?.innerText.trim() || '',
                 prajati: objCells.item(1)?.innerText.trim() || '',
                 dasha: objCells.item(2)?.innerText.trim() || '',
                 isWeighed: objCells.item(3)?.innerText.trim() || '',
                 datePublished: objCells.item(4)?.innerText.trim() || '',
-                expiryDate: objCells.item(5)?.innerText.trim() || '',
+                startDate: objCells.item(5)?.innerText.trim() || '',
                 class: objCells.item(6)?.innerText.trim() || '',
                 medium: objCells.item(7)?.innerText.trim() || '',
                 name: growerName,
                 fatherName: fatherName,
                 villageName: villageName,
                 BondRunner: runner,
+                factoryName: factorySelectValue,
               };
 
               let entry = { values };
 
-
-
-
               if (
                 values['datePublished'] === currentDate) {
-
-            
-                
                 data.push(entry);
               }
-
-
             }
           }
         }
         return { name: growerName, entries: data, };
-      }, fatherName, growerName, villageName, runner,currentDate);
+      }, fatherName, growerName, villageName, runner, currentDate,factorySelectValue);
 
       if (rawData.entries.length > 0) {
         console.log(rawData);
 
         // Assuming you're using Supabase client here, perform the insert outside page.evaluate()
         for (let entry of rawData.entries) {
-          const { data, error } = await supabase
+          // Check if record exists
+          const { data: existing, error: checkError } = await supabase
             .from('Ticket')
-            .insert([
-              { Ticket_Number: entry.values.ticketNo, Name:entry.values.name,
-                FatherName:entry.values.fatherName,VillageName:entry.values.villageName,
-                datePublished:entry.values.datePublished,expiryDate:entry.values.expiryDate },
-            ])
-            .select();
+            .select('Ticket_Number')
+            .eq('Ticket_Number', entry.values.ticketNo);
 
-          if (error) {
-            console.error('Supabase insert error: ', error);
+          if (checkError) {
+            console.error('Error checking existing ticket:', checkError);
           } else {
-            console.log('Inserted ticket:', data);
+            // If exists, delete old entry
+            if (existing && existing.length > 0) {
+              const { error: deleteError } = await supabase
+                .from('Ticket')
+                .delete()
+                .eq('Ticket_Number', entry.values.ticketNo);
+
+              if (deleteError) {
+                console.error('Error deleting old ticket:', deleteError);
+              }
+            }
+
+            // Insert new entry
+            const { data, error } = await supabase
+              .from('Ticket')
+              .insert([
+                {
+                  Ticket_Number: entry.values.ticketNo,
+                  Name: entry.values.name,
+                  FatherName: entry.values.fatherName,
+                  VillageName: entry.values.villageName,
+                  datePublished: entry.values.datePublished,
+                  startDate: entry.values.startDate,
+                },
+              ])
+              .select();
+
+            if (error) {
+              console.error('Error inserting ticket:', error);
+            } else {
+              console.log('Ticket inserted:', data);
+            }
           }
+
         }
 
         finalList.push(rawData);
@@ -281,13 +323,19 @@ function formatCurrentDate() {
 
 
 
-// Lambda-compatible handler function
-(async () => {
+// Lambda handler
+export const handler = async (event = {}) => {
+  // Reset state: Lambda may reuse the same container between runs
+  browser = null;
+  page = null;
+  finalList = [];
+  let captchaText = '';
   try {
     console.log('Factory length:', allFactories.length, 'Grower length:', allGrowers.length);
-    const supabaseUrl = 'https://sbowguaccgobcghxcqht.supabase.co'
-      const supabaseKey='myKey'
-    supabase = createClient(supabaseUrl, supabaseKey)
+    if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
+      throw new Error('SUPABASE_URL and SUPABASE_KEY env vars are required');
+    }
+    supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
     // Initialize the browser
     await initBrowser();
     console.log("Browser launched");
@@ -296,7 +344,7 @@ function formatCurrentDate() {
     await captureCaptchaImage("https://enquiry.caneup.in/", "#imgCaptcha");
 
     // Recognize captcha text
-    const captchaText = await recognizeCaptcha();
+    captchaText = await recognizeCaptcha();
     console.log("Captcha text:", captchaText);
 
 
@@ -310,10 +358,13 @@ function formatCurrentDate() {
     let data = await retrieveData(allVillages, allFactories, allGrowers, BondRunners);
 
     while (data === "errord") {
+      await browser.close();
+      await sleep(2000);
+      browser = null;
       await initBrowser();
       console.log("Browser launched");
       await captureCaptchaImage("https://enquiry.caneup.in/", "#imgCaptcha");
-      const captchaText = await recognizeCaptcha();
+      captchaText = await recognizeCaptcha();
       console.log("Captcha text:", captchaText);
       await validateCaptcha(captchaText);
       await sleep(600);
@@ -321,16 +372,19 @@ function formatCurrentDate() {
     }
     // Print the final results
     console.log("Final Data:", JSON.stringify({ captcha: captchaText, tickets: data }, null, 2));
+    return { statusCode: 200, body: JSON.stringify({ growersWithTickets: data.length }) };
   } catch (error) {
     console.error("Error:", error.message);
+    throw error; // mark the Lambda run as failed
   } finally {
     // Close the browser to avoid resource leaks
     if (browser) {
       await browser.close();
+      browser = null;
       console.log("Browser closed");
     }
   }
-})();
+};
 
 
 

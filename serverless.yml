@@ -1,27 +1,33 @@
-service: scrap-Automation
+service: scrap-automation
+
+frameworkVersion: '3'
+useDotenv: true               # reads SUPABASE_URL / SUPABASE_KEY from .env at deploy time
 
 provider:
   name: aws
-  runtime: nodejs18.x
-  region: us-east-1
-  timeout: 30
-  memorySize: 1024
+  runtime: nodejs20.x
+  architecture: x86_64        # @sparticuz/chromium needs x86_64
+  region: ap-south-1          # Mumbai, closest to the target site
+  timeout: 900                # 15 min (Lambda maximum)
+  memorySize: 2048
   environment:
-    TMPDIR: /tmp
+    SUPABASE_URL: ${env:SUPABASE_URL}
+    SUPABASE_KEY: ${env:SUPABASE_KEY}
 
 functions:
-  captchaHandler:
+  scraper:
     handler: index.handler
     events:
-      - http:
-          path: /
-          method: post
+      # Times are in UTC (IST = UTC + 5:30)
+      - schedule: cron(15 11 * * ? *)   # 4:45 PM IST daily
+      - schedule: cron(0 12 * * ? *)    # 5:30 PM IST daily
 
-plugins:
-  - serverless-plugin-chrome
-
-custom:
-  chrome:
-    flags:
-      - --no-sandbox
-      - --disable-dev-shm-usage
+package:
+  patterns:
+    - '!.git/**'
+    - '!.env'
+    - '!*.zip'
+    - '!*.xlsx'
+    - '!captcha.jpg'
+    - '!local.mjs'
+    - '!node_modules/serverless/**'
